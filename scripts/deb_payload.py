@@ -17,8 +17,8 @@ _DISCARDED_PARENT_DIRECTORIES = {
     "usr/share/lintian",
     "usr/share/lintian/overrides",
 }
-_EXACT_FILES = {
-    "usr/bin/chatgpt",
+_LAUNCHER_PATH = "usr/bin/chatgpt"
+_EXACT_REGULAR_FILES = {
     "usr/share/applications/chatgpt.desktop",
     "usr/share/doc/chatgpt/copyright",
     "usr/share/pixmaps/chatgpt.png",
@@ -125,7 +125,13 @@ def _validate_location(path: str, kind: str) -> bool | None:
         return True
     if path.startswith("usr/lib/chatgpt/"):
         return False
-    if path in _EXACT_FILES:
+    if path == _LAUNCHER_PATH:
+        if kind != "symlink":
+            raise ValueError(f"launcher is not a symbolic link: {path}")
+        return False
+    if path in _EXACT_REGULAR_FILES:
+        if kind != "file":
+            raise ValueError(f"exact payload file is not regular: {path}")
         return False
     if path in _DIRECTORY_ANCESTORS and kind == "directory":
         return False
@@ -203,24 +209,6 @@ def inspect_payload(deb_path: Path) -> list[PayloadMember]:
     return inspected
 
 
-def _remove_discarded_metadata(staging_directory: Path, members: list[PayloadMember]) -> None:
-    discarded_path = staging_directory / _DISCARDED_MEMBER
-    if discarded_path.exists():
-        discarded_path.unlink()
-
-    accepted_directories = {member.path for member in members if member.kind == "directory" and not member.discarded}
-    current = discarded_path.parent
-    while current != staging_directory:
-        relative_path = current.relative_to(staging_directory).as_posix()
-        if relative_path in accepted_directories:
-            break
-        try:
-            current.rmdir()
-        except OSError:
-            break
-        current = current.parent
-
-
 def stage_payload(deb_path: Path, destination: Path) -> list[PayloadMember]:
     """Safely stage the accepted data payload without running Debian package hooks."""
 
@@ -232,14 +220,24 @@ def stage_payload(deb_path: Path, destination: Path) -> list[PayloadMember]:
     staging_directory = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     try:
         result = subprocess.run(
-            ["bsdtar", "-xpf", "-", "-C", str(staging_directory), "--no-same-owner"],
+            [
+                "bsdtar",
+                "--exclude",
+                "./usr/share/lintian",
+                "--exclude",
+                "usr/share/lintian",
+                "-xpf",
+                "-",
+                "-C",
+                str(staging_directory),
+                "--no-same-owner",
+            ],
             input=payload,
             check=False,
             capture_output=True,
         )
         if result.returncode:
             raise ValueError(f"could not extract validated data payload: {result.stderr.decode(errors='replace').strip()}")
-        _remove_discarded_metadata(staging_directory, members)
         if destination.exists():
             destination.rmdir()
         staging_directory.replace(destination)

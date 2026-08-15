@@ -7,7 +7,9 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
+import scripts.deb_payload as deb_payload
 from scripts.deb_payload import stage_payload
 from tests.test_review_source import _write_tar
 
@@ -126,7 +128,8 @@ class DebPayloadStagingTests(unittest.TestCase):
             deb_path = _build_deb(directory, _valid_members())
             destination = directory / "pkgdir"
 
-            members = stage_payload(deb_path, destination)
+            with mock.patch.object(deb_payload.subprocess, "run", wraps=subprocess.run) as run:
+                members = stage_payload(deb_path, destination)
 
             binary = destination / "usr/lib/chatgpt/ChatGPT"
             self.assertEqual(binary.read_bytes(), b"desktop-binary")
@@ -138,6 +141,11 @@ class DebPayloadStagingTests(unittest.TestCase):
             self.assertFalse((destination / "usr/share/lintian").exists())
             self.assertFalse((destination / "control-only").exists())
             self.assertNotIn("usr/share/lintian/overrides/chatgpt", [member.path for member in members])
+            bsdtar_arguments = next(
+                call.args[0] for call in run.call_args_list if call.args[0][0] == "bsdtar"
+            )
+            self.assertIn("./usr/share/lintian", bsdtar_arguments)
+            self.assertIn("usr/share/lintian", bsdtar_arguments)
 
     def test_rejects_absolute_member_without_destination(self) -> None:
         self._assert_rejected_without_destination([{"name": "/usr/lib/chatgpt/evil", "kind": "file"}])
@@ -147,6 +155,19 @@ class DebPayloadStagingTests(unittest.TestCase):
 
     def test_rejects_unallowlisted_member_without_destination(self) -> None:
         self._assert_rejected_without_destination([{"name": "usr/share/unsupported", "kind": "file"}])
+
+    def test_rejects_non_symlink_launcher_without_destination(self) -> None:
+        self._assert_rejected_without_destination([{"name": "usr/bin/chatgpt", "kind": "file"}])
+
+    def test_rejects_non_regular_exact_file_without_destination(self) -> None:
+        self._assert_rejected_without_destination(
+            [
+                {
+                    "name": "usr/share/applications/chatgpt.desktop",
+                    "kind": "directory",
+                }
+            ]
+        )
 
     def test_rejects_duplicate_member_without_destination(self) -> None:
         self._assert_rejected_without_destination(
