@@ -5,12 +5,18 @@ import io
 from pathlib import Path
 import posixpath
 import re
+import shutil
 import subprocess
 import tarfile
+import tempfile
 
 
 _ARCHIVE_MEMBER_PATTERN = re.compile(r"^(?:control|data)\.tar\.[A-Za-z0-9]+$")
 _DISCARDED_MEMBER = "usr/share/lintian/overrides/chatgpt"
+_DISCARDED_PARENT_DIRECTORIES = {
+    "usr/share/lintian",
+    "usr/share/lintian/overrides",
+}
 _EXACT_FILES = {
     "usr/bin/chatgpt",
     "usr/share/applications/chatgpt.desktop",
@@ -85,13 +91,13 @@ def _find_archive_member(deb_path: Path, prefix: str) -> str:
     return candidates[0]
 
 
-def _normalise_path(name: str) -> str:
+def _normalise_path(name: str) -> str | None:
     if name.startswith("/"):
         raise ValueError(f"absolute archive path is not allowed: {name}")
     while name.startswith("./"):
         name = name[2:]
     if not name or name == ".":
-        raise ValueError("empty archive path is not allowed")
+        return None
     pieces = name.split("/")
     if any(piece in {"", ".", ".."} for piece in pieces):
         raise ValueError(f"unsafe archive path is not allowed: {name}")
@@ -108,7 +114,11 @@ def _kind(member: tarfile.TarInfo) -> str:
     raise ValueError(f"unsupported archive member type for {member.name}")
 
 
-def _validate_location(path: str, kind: str) -> bool:
+def _validate_location(path: str, kind: str) -> bool | None:
+    if path in _DISCARDED_PARENT_DIRECTORIES:
+        if kind != "directory":
+            raise ValueError(f"discarded Debian metadata parent is not a directory: {path}")
+        return None
     if path == _DISCARDED_MEMBER:
         if kind != "file":
             raise ValueError(f"discarded Debian metadata is not a regular file: {path}")
@@ -136,8 +146,8 @@ def _validate_link(path: str, target: str) -> None:
         raise ValueError(f"symbolic link escapes the ChatGPT payload: {path}")
 
 
-def inspect_payload(deb_path: Path) -> list[PayloadMember]:
-    """Return validated `data.tar.*` metadata without extracting the payload."""
+def _inspect_payload_data(deb_path: Path) -> tuple[list[PayloadMember], bytes]:
+    """Return fully validated metadata and the corresponding immutable data bytes."""
 
     validate_debian_binary(deb_path)
     data_member = _find_archive_member(deb_path, "data")
@@ -151,16 +161,25 @@ def inspect_payload(deb_path: Path) -> list[PayloadMember]:
         inspected: list[PayloadMember] = []
         seen_paths: set[str] = set()
         for member in archive.getmembers():
+            if member.mode & 0o6000:
+                raise ValueError(f"setuid or setgid payload member is not allowed: {member.name}")
+            if any(key.endswith("security.capability") for key in member.pax_headers):
+                raise ValueError(f"file capability payload member is not allowed: {member.name}")
             path = _normalise_path(member.name)
+            if path is None:
+                if not member.isdir():
+                    raise ValueError("archive root entry must be a directory")
+                if "." in seen_paths:
+                    raise ValueError("duplicate payload member: .")
+                seen_paths.add(".")
+                continue
             if path in seen_paths:
                 raise ValueError(f"duplicate payload member: {path}")
             seen_paths.add(path)
-            if member.mode & 0o6000:
-                raise ValueError(f"setuid or setgid payload member is not allowed: {path}")
-            if any(key.endswith("security.capability") for key in member.pax_headers):
-                raise ValueError(f"file capability payload member is not allowed: {path}")
             kind = _kind(member)
             discarded = _validate_location(path, kind)
+            if discarded is None:
+                continue
             target = member.linkname if kind == "symlink" else None
             if target is not None:
                 _validate_link(path, target)
@@ -174,4 +193,72 @@ def inspect_payload(deb_path: Path) -> list[PayloadMember]:
                     discarded=discarded,
                 )
             )
+    return inspected, payload
+
+
+def inspect_payload(deb_path: Path) -> list[PayloadMember]:
+    """Return validated `data.tar.*` metadata without extracting the payload."""
+
+    inspected, _payload = _inspect_payload_data(deb_path)
     return inspected
+
+
+def _remove_discarded_metadata(staging_directory: Path, members: list[PayloadMember]) -> None:
+    discarded_path = staging_directory / _DISCARDED_MEMBER
+    if discarded_path.exists():
+        discarded_path.unlink()
+
+    accepted_directories = {member.path for member in members if member.kind == "directory" and not member.discarded}
+    current = discarded_path.parent
+    while current != staging_directory:
+        relative_path = current.relative_to(staging_directory).as_posix()
+        if relative_path in accepted_directories:
+            break
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def stage_payload(deb_path: Path, destination: Path) -> list[PayloadMember]:
+    """Safely stage the accepted data payload without running Debian package hooks."""
+
+    if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
+        raise ValueError(f"destination must be absent or an empty directory: {destination}")
+
+    members, payload = _inspect_payload_data(deb_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging_directory = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
+    try:
+        result = subprocess.run(
+            ["bsdtar", "-xpf", "-", "-C", str(staging_directory), "--no-same-owner"],
+            input=payload,
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode:
+            raise ValueError(f"could not extract validated data payload: {result.stderr.decode(errors='replace').strip()}")
+        _remove_discarded_metadata(staging_directory, members)
+        if destination.exists():
+            destination.rmdir()
+        staging_directory.replace(destination)
+    except Exception:
+        shutil.rmtree(staging_directory, ignore_errors=True)
+        raise
+    return [member for member in members if not member.discarded]
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Safely stage the allowlisted ChatGPT Debian payload")
+    parser.add_argument("--deb", type=Path, required=True, help="path to the checked Debian artifact")
+    parser.add_argument("--destination", type=Path, required=True, help="empty or absent package destination")
+    arguments = parser.parse_args()
+    stage_payload(arguments.deb, arguments.destination)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
