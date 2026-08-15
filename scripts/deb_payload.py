@@ -66,6 +66,14 @@ def _read_ar_member(deb_path: Path, member: str) -> bytes:
     return result.stdout
 
 
+def validate_debian_binary(deb_path: Path) -> None:
+    members = _ar_members(deb_path)
+    if members.count("debian-binary") != 1:
+        raise ValueError("expected exactly one debian-binary archive member")
+    if _read_ar_member(deb_path, "debian-binary") != b"2.0\n":
+        raise ValueError("debian-binary must contain exactly 2.0\\n")
+
+
 def _find_archive_member(deb_path: Path, prefix: str) -> str:
     candidates = [
         member
@@ -131,6 +139,7 @@ def _validate_link(path: str, target: str) -> None:
 def inspect_payload(deb_path: Path) -> list[PayloadMember]:
     """Return validated `data.tar.*` metadata without extracting the payload."""
 
+    validate_debian_binary(deb_path)
     data_member = _find_archive_member(deb_path, "data")
     payload = _read_ar_member(deb_path, data_member)
     try:

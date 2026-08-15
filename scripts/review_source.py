@@ -8,9 +8,9 @@ from pathlib import Path
 import tarfile
 
 try:
-    from .deb_payload import _find_archive_member, _read_ar_member, inspect_payload
+    from .deb_payload import _find_archive_member, _read_ar_member, inspect_payload, validate_debian_binary
 except ImportError:  # Executed directly as `python scripts/review_source.py`.
-    from deb_payload import _find_archive_member, _read_ar_member, inspect_payload
+    from deb_payload import _find_archive_member, _read_ar_member, inspect_payload, validate_debian_binary
 
 
 _REQUIRED_CONTROL_FIELDS = {"Package", "Version", "Architecture"}
@@ -48,6 +48,7 @@ def _parse_control(contents: bytes) -> dict[str, str]:
 def read_deb_control(deb_path: Path) -> dict[str, str]:
     """Read the control file from a `.deb` without unpacking it to disk."""
 
+    validate_debian_binary(deb_path)
     control_member = _find_archive_member(deb_path, "control")
     payload = _read_ar_member(deb_path, control_member)
     try:
@@ -55,11 +56,13 @@ def read_deb_control(deb_path: Path) -> dict[str, str]:
     except (tarfile.ReadError, EOFError) as error:
         raise ValueError(f"could not read {control_member}") from error
     with archive:
-        control_files = [
-            member
-            for member in archive.getmembers()
-            if member.name.lstrip("./") == "control" and member.isreg()
-        ]
+        control_files = []
+        for member in archive.getmembers():
+            name_parts = member.name.split("/")
+            if member.name.startswith("/") or ".." in name_parts:
+                raise ValueError(f"unsafe control archive member: {member.name}")
+            if member.name in {"control", "./control"} and member.isreg():
+                control_files.append(member)
         if len(control_files) != 1:
             raise ValueError(f"expected exactly one regular control file, found {len(control_files)}")
         extracted = archive.extractfile(control_files[0])

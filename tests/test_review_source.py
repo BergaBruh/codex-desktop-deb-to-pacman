@@ -44,20 +44,30 @@ def _build_deb(
     architecture: str = "amd64",
     include_control: bool = True,
     duplicate_control: bool = False,
+    include_data: bool = True,
+    duplicate_data: bool = False,
+    debian_binary_contents: str = "2.0\n",
+    data_members: list[tuple[str, str, bytes | str, int]] | None = None,
+    control_member_name: str = "control",
 ) -> Path:
     debian_binary = directory / "debian-binary"
     data_archive = directory / "data.tar.gz"
     control_archive = directory / "control.tar.gz"
-    debian_binary.write_text("2.0\n", encoding="ascii")
-    _write_tar(
-        data_archive,
-        [
+    debian_binary.write_text(debian_binary_contents, encoding="ascii")
+    if data_members is None:
+        data_members = [
             ("usr/lib/chatgpt/ChatGPT", "file", b"desktop", 100),
             ("usr/bin/chatgpt", "symlink", "../lib/chatgpt/codex-launcher", 200),
             ("usr/share/lintian/overrides/chatgpt", "file", b"lint", 500),
-        ],
-    )
-    members = [debian_binary, data_archive]
+        ]
+    _write_tar(data_archive, data_members)
+    members = [debian_binary]
+    if include_data:
+        members.append(data_archive)
+        if duplicate_data:
+            duplicate = directory / "data.tar.xz"
+            duplicate.write_bytes(data_archive.read_bytes())
+            members.append(duplicate)
     if include_control:
         control_text = (
             f"Package: {package}\n"
@@ -66,7 +76,7 @@ def _build_deb(
             "Description: ChatGPT desktop application\n"
             " continuation line\n"
         ).encode("utf-8")
-        _write_tar(control_archive, [("control", "file", control_text, 1)])
+        _write_tar(control_archive, [(control_member_name, "file", control_text, 1)])
         members.insert(1, control_archive)
         if duplicate_control:
             duplicate = directory / "control.tar.xz"
@@ -129,6 +139,74 @@ class ReviewSourceTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "exactly one control.tar"):
                 read_deb_control(deb_path)
+
+    def test_review_rejects_missing_debian_format_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_directory = Path(temporary_directory)
+            deb_path = _build_deb(fixture_directory)
+            (fixture_directory / "debian-binary").unlink()
+            subprocess.run(
+                ["ar", "d", str(deb_path), "debian-binary"],
+                check=True,
+            )
+
+            with self.assertRaisesRegex(ValueError, "debian-binary"):
+                review_source(deb_path)
+
+    def test_review_rejects_malformed_debian_format_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deb_path = _build_deb(Path(temporary_directory), debian_binary_contents="3.0\n")
+
+            with self.assertRaisesRegex(ValueError, "2.0"):
+                review_source(deb_path)
+
+    def test_control_reader_rejects_traversal_control_member(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deb_path = _build_deb(Path(temporary_directory), control_member_name="../control")
+
+            with self.assertRaisesRegex(ValueError, "control"):
+                read_deb_control(deb_path)
+
+    def test_review_rejects_missing_data_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deb_path = _build_deb(Path(temporary_directory), include_data=False)
+
+            with self.assertRaisesRegex(ValueError, "data.tar"):
+                review_source(deb_path)
+
+    def test_review_rejects_duplicate_data_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deb_path = _build_deb(Path(temporary_directory), duplicate_data=True)
+
+            with self.assertRaisesRegex(ValueError, "exactly one data.tar"):
+                review_source(deb_path)
+
+    def test_review_rejects_unallowlisted_data_member(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deb_path = _build_deb(
+                Path(temporary_directory),
+                data_members=[("usr/share/unsupported", "file", b"no", 1)],
+            )
+
+            with self.assertRaisesRegex(ValueError, "unallowlisted"):
+                review_source(deb_path)
+
+    def test_review_rejects_non_regular_lintian_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deb_path = _build_deb(
+                Path(temporary_directory),
+                data_members=[
+                    (
+                        "usr/share/lintian/overrides/chatgpt",
+                        "symlink",
+                        "../chatgpt",
+                        1,
+                    )
+                ],
+            )
+
+            with self.assertRaisesRegex(ValueError, "discarded Debian metadata"):
+                review_source(deb_path)
 
     def test_cli_emits_sorted_json_without_writing_next_to_input(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
