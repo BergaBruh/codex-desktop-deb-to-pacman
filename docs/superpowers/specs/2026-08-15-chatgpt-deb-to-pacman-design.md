@@ -79,6 +79,18 @@ artifact URL. HTTPS plus the reviewed pinned hash protects the build input from
 silent replacement after review, but does not create a stronger independent
 upstream signature chain; the package must not claim otherwise.
 
+The implementation must include `scripts/update_source.py` as the trusted
+mechanical step after a human completes that review. Its default operation is
+read-only and reports the candidate control metadata, SHA-256, accepted
+manifest, discarded lintian member, and `SOURCE_DATE_EPOCH`; it does not fetch
+from the network or edit files. It may rewrite `PKGBUILD`'s `pkgver`, `pkgrel`,
+checksum, and `SOURCE_DATE_EPOCH`, then regenerate `.SRCINFO`, only when the
+operator provides all of `--apply --expected-version VERSION
+--expected-sha256 HASH`. The expected values must equal the locally reviewed
+artifact, and an invocation missing either flag or with a mismatch must leave
+both files unchanged. The script is a guarded editor, not an automatic
+updater: download, binary review, and final operator decision remain manual.
+
 ## Archive and installation data flow
 
 ```text
@@ -86,7 +98,7 @@ OpenAI HTTPS .deb
   -> SHA-256 verification by makepkg
   -> extract ar container
   -> extract data.tar.* only
-  -> validate source-path allowlist
+  -> validate source-path allowlist and discard only usr/share/lintian/overrides/chatgpt
   -> stage approved files in $pkgdir unchanged
   -> build chatgpt-bin-x86_64.pkg.tar.*
 ```
@@ -102,13 +114,21 @@ top-level payload path for manual review:
 
 - `/usr/lib/chatgpt/**` — the upstream executable, launcher, Chromium/Electron
   resources, bundled libraries, locales, and license material.
-- `/usr/bin/chatgpt` — the upstream symlink to
-  `/usr/lib/chatgpt/codex-launcher`; preserve it rather than adding a wrapper.
+- `/usr/bin/chatgpt` — the upstream relative symlink
+  `../lib/chatgpt/codex-launcher`; preserve that target unchanged rather than
+  adding a wrapper.
 - `/usr/share/applications/chatgpt.desktop` and
   `/usr/share/doc/chatgpt/copyright`.
 - `/usr/share/pixmaps/chatgpt.png` — the icon named by the upstream desktop
   entry.
 - `/etc/apparmor.d/chatgpt` as described in the AppArmor section.
+
+The snapshot also contains
+`/usr/share/lintian/overrides/chatgpt`. It is Debian lintian metadata, not
+runtime data, and is the sole intentional allowlist exception: validate its
+exact path and discard it without staging it. No wildcard applies to this
+exception. Every other unallowlisted data member, including any newly added
+file under `/usr/share`, must reject the entire payload for manual review.
 
 The package may additionally copy the supplied copyright notice into
 `/usr/share/licenses/chatgpt-bin/` to meet Arch license-location conventions.
@@ -197,9 +217,12 @@ The implementation is acceptable only when all of these are true:
 2. The extracted Debian control metadata reports exactly version `26.810.52044`
    and architecture `amd64` for this release, while the produced Pacman package
    reports `chatgpt-bin`, `26.810.52044-1`, and `x86_64`.
-3. A file-list comparison shows only the allowlisted payload, the Arch license
-   copy, and no `/etc/apt`, `/usr/share/keyrings`, APT source file, Debian
-   maintainer script, setuid/setgid file, or file capability.
+3. The source-member manifest contains only allowlisted payload members plus
+   the one exact discarded member `/usr/share/lintian/overrides/chatgpt`; the
+   staged file list contains only the allowlisted payload and Arch license
+   copy. Any other unallowlisted member rejects the payload. Neither list may
+   contain `/etc/apt`, `/usr/share/keyrings`, an APT source file, a Debian
+   maintainer script, a setuid/setgid file, or a file capability.
 4. `desktop-file-validate` accepts the installed desktop entry; its `Exec`
    target resolves through `/usr/bin/chatgpt` to the upstream launcher, and
    `Icon=chatgpt` resolves to `/usr/share/pixmaps/chatgpt.png`.
@@ -218,6 +241,10 @@ The implementation is acceptable only when all of these are true:
    metadata. If archive-level bytes differ because of package signing or build
    metadata, compare the unsigned normalized package payload and metadata;
    record any remaining difference as a release blocker.
+9. `scripts/update_source.py --deb PATH` is read-only and makes no network
+   request. Its only successful mutation path is `--apply --expected-version
+   VERSION --expected-sha256 HASH` with values matching `PATH`; it resets
+   `pkgrel=1`, writes the reviewed epoch, and regenerates `.SRCINFO`.
 
 ## Spec self-review
 
