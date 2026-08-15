@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 
@@ -38,7 +39,12 @@ def _replace_assignments(contents: str, metadata: dict[str, object]) -> str:
 
 
 def _atomic_write(path: Path, contents: bytes) -> None:
+    target_stat = path.stat()
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary_file:
+        temporary_stat = os.fstat(temporary_file.fileno())
+        os.fchmod(temporary_file.fileno(), stat.S_IMODE(target_stat.st_mode))
+        if (temporary_stat.st_uid, temporary_stat.st_gid) != (target_stat.st_uid, target_stat.st_gid):
+            os.fchown(temporary_file.fileno(), target_stat.st_uid, target_stat.st_gid)
         temporary_file.write(contents)
         temporary_file.flush()
         os.fsync(temporary_file.fileno())

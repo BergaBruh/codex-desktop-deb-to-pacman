@@ -146,9 +146,15 @@ class UpdateSourceTests(unittest.TestCase):
             directory = Path(temporary_directory)
             deb_path = _build_deb(directory)
             repository, pkgbuild, srcinfo, calls = self._repository_fixture(directory)
+            pkgbuild.chmod(0o754)
+            srcinfo.chmod(0o640)
             checksum = hashlib.sha256(deb_path.read_bytes()).hexdigest()
             expected_source_line = "source=('https://example.invalid/chatgpt_amd64.deb')"
             previous = pkgbuild.read_text(encoding="utf-8")
+            expected = previous.replace("pkgver=0.0.1", "pkgver=26.810.52044")
+            expected = expected.replace("pkgrel=7", "pkgrel=1")
+            expected = expected.replace("sha256sums=('old-checksum')", f"sha256sums=('{checksum}')")
+            expected = expected.replace("SOURCE_DATE_EPOCH=1", "SOURCE_DATE_EPOCH=200")
             environment = {
                 "PATH": f"{directory / 'bin'}:{os.environ['PATH']}",
                 "MAKEPKG_CALLS": str(calls),
@@ -164,15 +170,14 @@ class UpdateSourceTests(unittest.TestCase):
                 )
 
             updated = pkgbuild.read_text(encoding="utf-8")
-            self.assertIn("pkgver=26.810.52044", updated)
-            self.assertIn("pkgrel=1", updated)
-            self.assertIn(f"sha256sums=('{checksum}')", updated)
-            self.assertIn("SOURCE_DATE_EPOCH=200", updated)
+            self.assertEqual(updated, expected)
             self.assertIn(expected_source_line, updated)
             self.assertEqual(srcinfo.read_text(encoding="utf-8"), _SRCINFO)
             self.assertEqual(calls.read_text(encoding="utf-8"), "--printsrcinfo\n")
             self.assertEqual(result["source_date_epoch"], 200)
             self.assertNotEqual(updated, previous)
+            self.assertEqual(pkgbuild.stat().st_mode & 0o777, 0o754)
+            self.assertEqual(srcinfo.stat().st_mode & 0o777, 0o640)
 
     def test_makepkg_failure_restores_original_metadata_and_srcinfo(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -182,6 +187,8 @@ class UpdateSourceTests(unittest.TestCase):
             fake_makepkg = directory / "bin" / "makepkg"
             fake_makepkg.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
             fake_makepkg.chmod(0o755)
+            pkgbuild.chmod(0o750)
+            srcinfo.chmod(0o600)
             before_pkgbuild = pkgbuild.read_bytes()
             before_srcinfo = srcinfo.read_bytes()
             environment = {"PATH": f"{directory / 'bin'}:{os.environ['PATH']}"}
@@ -198,6 +205,8 @@ class UpdateSourceTests(unittest.TestCase):
 
             self.assertEqual(pkgbuild.read_bytes(), before_pkgbuild)
             self.assertEqual(srcinfo.read_bytes(), before_srcinfo)
+            self.assertEqual(pkgbuild.stat().st_mode & 0o777, 0o750)
+            self.assertEqual(srcinfo.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":
