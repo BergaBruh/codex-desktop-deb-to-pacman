@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+from pathlib import Path
+import re
+import unittest
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+PKGBUILD_PATH = REPOSITORY_ROOT / "PKGBUILD"
+SRCINFO_PATH = REPOSITORY_ROOT / ".SRCINFO"
+README_PATH = REPOSITORY_ROOT / "README.md"
+
+_URL = "https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.deb"
+_SHA256 = "708a15a1bb76e2bb7f0e376e5145391fa277ad3a64057c1d32537bdc2a1b4e6e"
+_DEPENDS = {
+    "alsa-lib",
+    "at-spi2-core",
+    "cairo",
+    "cups",
+    "dbus",
+    "expat",
+    "gcc-libs",
+    "gdk-pixbuf2",
+    "glib2",
+    "glibc",
+    "gtk3",
+    "libdrm",
+    "libnotify",
+    "libx11",
+    "libxcb",
+    "libxcomposite",
+    "libxdamage",
+    "libxext",
+    "libxfixes",
+    "libxkbcommon",
+    "libxrandr",
+    "mesa",
+    "nspr",
+    "nss",
+    "pango",
+    "systemd-libs",
+    "xdg-utils",
+}
+_MAKEDEPENDS = {"python", "binutils", "libarchive"}
+
+
+def _srcinfo_value(contents: str, field: str) -> str:
+    match = re.search(rf"^\s*{re.escape(field)} = (.+)$", contents, re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"missing {field} in .SRCINFO")
+    return match.group(1)
+
+
+class PkgbuildContractTests(unittest.TestCase):
+    def test_pinned_metadata_dependencies_and_safe_staging_contract(self) -> None:
+        contents = PKGBUILD_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("pkgname=chatgpt-bin", contents)
+        self.assertIn("pkgver=26.810.52044", contents)
+        self.assertIn("pkgrel=1", contents)
+        self.assertIn("arch=('x86_64')", contents)
+        self.assertIn("license=('custom')", contents)
+        self.assertIn(_URL, contents)
+        self.assertIn(_SHA256, contents)
+        self.assertIn("options=(!strip)", contents)
+        self.assertIn("backup=('etc/apparmor.d/chatgpt')", contents)
+        self.assertIn("SOURCE_DATE_EPOCH=1786770000", contents)
+        self.assertIn("apparmor: optional support for loading the upstream AppArmor profile", contents)
+        self.assertIn('python "$startdir/scripts/deb_payload.py"', contents)
+        self.assertIn('install -Dm644 "$pkgdir/usr/share/doc/chatgpt/copyright"', contents)
+
+        declared_dependencies = set(re.findall(r"^  '([^']+)'$", contents, re.MULTILINE))
+        self.assertEqual(declared_dependencies, _DEPENDS)
+        self.assertEqual(
+            set(re.findall(r"makedepends=\((.*?)\)", contents, re.DOTALL)[0].replace("'", "").split()),
+            _MAKEDEPENDS,
+        )
+        self.assertNotIn("apt", contents)
+        self.assertNotRegex(contents, r"(?m)^(?:build|prepare)\(\)")
+        for forbidden in (
+            "SKIP",
+            ".INSTALL",
+            "post_install",
+            "apparmor_parser",
+            "/etc/apt",
+            "keyring",
+            "chmod u+s",
+            "patchelf",
+            "upx",
+            "strip -",
+            "install -Dm755 \"$pkgdir/usr/bin/chatgpt\"",
+        ):
+            self.assertNotIn(forbidden, contents)
+
+    def test_desktop_icon_and_payload_paths_are_preserved(self) -> None:
+        payload_helper = (REPOSITORY_ROOT / "scripts" / "deb_payload.py").read_text(encoding="utf-8")
+
+        self.assertIn('"usr/share/applications/chatgpt.desktop"', payload_helper)
+        self.assertIn('"usr/share/pixmaps/chatgpt.png"', payload_helper)
+        self.assertIn('"etc/apparmor.d/chatgpt"', payload_helper)
+        self.assertIn('_LAUNCHER_PATH = "usr/bin/chatgpt"', payload_helper)
+        self.assertIn('target != "../lib/chatgpt/codex-launcher"', payload_helper)
+
+    def test_generated_srcinfo_matches_the_package_identity(self) -> None:
+        contents = SRCINFO_PATH.read_text(encoding="utf-8")
+
+        self.assertEqual(_srcinfo_value(contents, "pkgbase"), "chatgpt-bin")
+        self.assertEqual(_srcinfo_value(contents, "pkgver"), "26.810.52044")
+        self.assertEqual(_srcinfo_value(contents, "pkgrel"), "1")
+        self.assertEqual(_srcinfo_value(contents, "arch"), "x86_64")
+
+    def test_readme_exists_for_the_release_procedure(self) -> None:
+        self.assertTrue(README_PATH.is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()

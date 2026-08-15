@@ -86,6 +86,22 @@ def _valid_members() -> list[dict[str, object]]:
         {"name": "usr/share", "kind": "directory", "mode": 0o755, "mtime": 14},
         {"name": "usr/share/lintian", "kind": "directory", "mode": 0o755, "mtime": 15},
         {"name": "usr/share/lintian/overrides", "kind": "directory", "mode": 0o755, "mtime": 16},
+        {"name": "usr/share/applications", "kind": "directory", "mode": 0o755, "mtime": 17},
+        {
+            "name": "usr/share/applications/chatgpt.desktop",
+            "kind": "file",
+            "contents": b"[Desktop Entry]\nIcon=chatgpt\n",
+            "mode": 0o644,
+            "mtime": 18,
+        },
+        {"name": "usr/share/pixmaps", "kind": "directory", "mode": 0o755, "mtime": 19},
+        {
+            "name": "usr/share/pixmaps/chatgpt.png",
+            "kind": "file",
+            "contents": b"fixture-png",
+            "mode": 0o644,
+            "mtime": 20,
+        },
         {
             "name": "usr/lib/chatgpt/ChatGPT",
             "kind": "file",
@@ -137,6 +153,11 @@ class DebPayloadStagingTests(unittest.TestCase):
             self.assertEqual(int(binary.stat().st_mtime), 200)
             self.assertEqual((destination / "usr/lib/chatgpt").stat().st_mode & 0o777, 0o750)
             self.assertEqual(os.readlink(destination / "usr/bin/chatgpt"), "../lib/chatgpt/codex-launcher")
+            self.assertEqual(
+                (destination / "usr/share/applications/chatgpt.desktop").read_bytes(),
+                b"[Desktop Entry]\nIcon=chatgpt\n",
+            )
+            self.assertEqual((destination / "usr/share/pixmaps/chatgpt.png").read_bytes(), b"fixture-png")
             self.assertFalse((destination / "usr/share/lintian/overrides/chatgpt").exists())
             self.assertFalse((destination / "usr/share/lintian").exists())
             self.assertFalse((destination / "control-only").exists())
