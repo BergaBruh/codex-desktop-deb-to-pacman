@@ -92,12 +92,17 @@ It is not a sandbox, and this package does not load it.
 
 ## Clean-Arch release boundary
 
-Use a fresh verified source cache and two independent x86_64 clean chroots:
+Use a fresh verified source cache and two independent x86_64 clean chroots.
+`makechrootpkg` reads `SRCDEST`, while `-D` bind-mounts that cache read-only
+inside the chroot; `-I` is intentionally not used because it installs an Arch
+package into the chroot rather than providing a source artifact.
 
 ```sh
-makepkg --verifysource | tee verifysource.log
+SOURCE_CACHE=/fresh/cache
+test -f "$SOURCE_CACHE/chatgpt_amd64.deb"
+SRCDEST="$SOURCE_CACHE" makepkg --verifysource | tee verifysource.log
 SOURCE_DATE_EPOCH="$(python scripts/review_source.py --deb /fresh/cache/chatgpt_amd64.deb --format json | jq -r .source_date_epoch)" \
-  extra-x86_64-build -- -I /fresh/cache/chatgpt_amd64.deb
+  SRCDEST="$SOURCE_CACHE" extra-x86_64-build -D "$SOURCE_CACHE"
 ```
 
 Run the same command twice with the same reviewed artifact, tool version, and

@@ -77,6 +77,8 @@ class PkgbuildContractTests(unittest.TestCase):
         )
         self.assertNotIn("apt", contents)
         self.assertNotRegex(contents, r"(?m)^(?:build|prepare)\(\)")
+        package_body = contents.split("package() {", 1)[1]
+        self.assertNotRegex(package_body, r"(?m)^\s*strip(?:\s|$)")
         for forbidden in (
             "SKIP",
             ".INSTALL",
@@ -110,7 +112,11 @@ class PkgbuildContractTests(unittest.TestCase):
         self.assertEqual(_srcinfo_value(contents, "arch"), "x86_64")
 
     def test_readme_exists_for_the_release_procedure(self) -> None:
-        self.assertTrue(README_PATH.is_file())
+        contents = README_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('SRCDEST="$SOURCE_CACHE" makepkg --verifysource', contents)
+        self.assertIn('SRCDEST="$SOURCE_CACHE" extra-x86_64-build -D "$SOURCE_CACHE"', contents)
+        self.assertNotIn(" -- -I ", contents)
 
 
 if __name__ == "__main__":
