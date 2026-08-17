@@ -16,12 +16,30 @@ The pinned source is a mutable `latest` URL. The recorded SHA-256 is mandatory:
 
 ```sh
 makepkg --verifysource
-makepkg -s
+makepkg -si
 ```
 
 Never replace `sha256sums` with `SKIP`. HTTPS plus a pinned hash protects this
 reviewed input from silent replacement, but it is not an upstream signature
 chain.
+
+## Optional update checker
+
+Install the package and opt into the user timer with:
+
+```sh
+./scripts/install-and-enable-update-checker.sh
+systemctl --user list-timers chatgpt-bin-update-check.timer
+```
+
+Manual update flow:
+
+```sh
+chatgpt-bin-update check
+chatgpt-bin-update build
+chatgpt-bin-update install
+journalctl --user -u chatgpt-bin-update-check.service
+```
 
 ## Review and update a new source
 

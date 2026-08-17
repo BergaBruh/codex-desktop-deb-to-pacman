@@ -25,7 +25,6 @@ _DEPENDS = {
     "glibc",
     "gtk3",
     "libdrm",
-    "libnotify",
     "libx11",
     "libxcb",
     "libxcomposite",
@@ -34,14 +33,21 @@ _DEPENDS = {
     "libxfixes",
     "libxkbcommon",
     "libxrandr",
+    "libarchive",
     "mesa",
     "nspr",
     "nss",
     "pango",
+    "polkit",
+    "python",
     "systemd-libs",
     "xdg-utils",
 }
 _MAKEDEPENDS = {"python", "binutils", "libarchive"}
+_OPTDEPENDS = {
+    "apparmor: optional support for loading the upstream AppArmor profile",
+    "libnotify: desktop notifications for update checks; stdout fallback is used when unavailable",
+}
 
 
 def _srcinfo_value(contents: str, field: str) -> str:
@@ -51,9 +57,21 @@ def _srcinfo_value(contents: str, field: str) -> str:
     return match.group(1)
 
 
+def _srcinfo_values(contents: str, field: str) -> set[str]:
+    return set(re.findall(rf"^\s*{re.escape(field)} = (.+)$", contents, re.MULTILINE))
+
+
+def _pkgbuild_array(contents: str, name: str) -> set[str]:
+    match = re.search(rf"(?ms)^{re.escape(name)}=\((.*?)\)", contents)
+    if match is None:
+        raise AssertionError(f"missing {name} array in PKGBUILD")
+    return set(re.findall(r"'([^']+)'", match.group(1)))
+
+
 class PkgbuildContractTests(unittest.TestCase):
     def test_pinned_metadata_dependencies_and_safe_staging_contract(self) -> None:
         contents = PKGBUILD_PATH.read_text(encoding="utf-8")
+        srcinfo = SRCINFO_PATH.read_text(encoding="utf-8")
 
         self.assertIn("pkgname=chatgpt-bin", contents)
         self.assertIn("pkgver=26.810.52044", contents)
@@ -69,12 +87,12 @@ class PkgbuildContractTests(unittest.TestCase):
         self.assertIn('python "$startdir/scripts/deb_payload.py"', contents)
         self.assertIn('install -Dm644 "$pkgdir/usr/share/doc/chatgpt/copyright"', contents)
 
-        declared_dependencies = set(re.findall(r"^  '([^']+)'$", contents, re.MULTILINE))
-        self.assertEqual(declared_dependencies, _DEPENDS)
-        self.assertEqual(
-            set(re.findall(r"makedepends=\((.*?)\)", contents, re.DOTALL)[0].replace("'", "").split()),
-            _MAKEDEPENDS,
-        )
+        self.assertEqual(_pkgbuild_array(contents, "depends"), _DEPENDS)
+        self.assertEqual(_pkgbuild_array(contents, "makedepends"), _MAKEDEPENDS)
+        self.assertEqual(_pkgbuild_array(contents, "optdepends"), _OPTDEPENDS)
+        self.assertEqual(_srcinfo_values(srcinfo, "depends"), _DEPENDS)
+        self.assertEqual(_srcinfo_values(srcinfo, "makedepends"), _MAKEDEPENDS)
+        self.assertEqual(_srcinfo_values(srcinfo, "optdepends"), _OPTDEPENDS)
         self.assertNotIn("apt", contents)
         self.assertNotRegex(contents, r"(?m)^(?:build|prepare)\(\)")
         package_body = contents.split("package() {", 1)[1]

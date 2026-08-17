@@ -1,1 +1,9 @@
-.worktrees/
+/.worktrees/
+/pkg/
+/src/
+/*.pkg.tar.*
+/chatgpt_amd64.deb
+__pycache__/
+docs/
+chatgpt-bin/
+.superpowers/

@@ -1,0 +1,8 @@
+#!/bin/sh
+installed_checker=/usr/lib/chatgpt-bin/updater/check_update.py
+if [ -f "$installed_checker" ]; then
+  exec /usr/bin/python "$installed_checker" "$@"
+fi
+
+script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd) || exit 1
+exec /usr/bin/python "$script_dir/check_update.py" "$@"
