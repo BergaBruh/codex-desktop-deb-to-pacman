@@ -360,6 +360,31 @@ class CheckUpdateTests(unittest.TestCase):
             for forbidden in ("pacman", "sudo", "systemctl enable", "update_source"):
                 self.assertFalse(any(forbidden in command for command in captured_command_strings))
 
+    def test_deferred_new_candidate_notification_records_candidate_without_notifying(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            notify = _FakeNotify()
+            runner = _FakeRunner(notify, vercmp_result=1)
+
+            with (
+                mock.patch.dict(
+                    check_update.os.environ,
+                    {"XDG_CACHE_HOME": str(root / "cache"), "XDG_STATE_HOME": str(root / "state")},
+                    clear=False,
+                ),
+                mock.patch.object(check_update, "INSTALLED_METADATA_PATH", self._metadata(root)),
+                mock.patch.object(check_update, "NOTIFY_SEND", notify.path),
+                mock.patch.object(check_update.subprocess, "run", runner),
+                mock.patch.object(check_update.urllib.request, "urlopen", lambda _url: _Response([b"candidate"])),
+                mock.patch.object(check_update.review_source, "review_source", self._reviewer("26.900.1")),
+            ):
+                result = main(["--url", TEST_URL, "--defer-new-candidate-notification"])
+
+            paths = cache_paths({"XDG_CACHE_HOME": str(root / "cache"), "XDG_STATE_HOME": str(root / "state")})
+            self.assertEqual(result, 10)
+            self.assertEqual(read_record(paths).version, "26.900.1")
+            self.assertEqual(notify.calls, [])
+
     def test_candidate_download_uses_firefox_linux_user_agent_request(self) -> None:
         captured_requests: list[object] = []
 

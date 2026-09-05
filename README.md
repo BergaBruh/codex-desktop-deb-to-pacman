@@ -1,156 +1,215 @@
-# chatgpt-bin
+# chatgpt-bin for Arch Linux
 
-An Arch Linux `chatgpt-bin` package made from the checked data payload of
-OpenAI's official x86_64 Debian desktop artifact. It preserves the upstream
-application, `chatgpt` launcher symlink, desktop entry, pixmap, and AppArmor
-profile, but never runs or copies Debian maintainer scripts. In particular, it
-does not add an APT source, signing key, or AppArmor load/unload action.
+An unofficial Arch Linux `x86_64` package for the ChatGPT desktop app. It takes
+the verified payload from OpenAI's official Debian artifact and installs it
+through Pacman. This is not an OpenAI package, an AUR recipe supported by
+OpenAI, or a guarantee that the client itself can update on Linux.
 
-## Build prerequisites
+The package does not add an APT repository or key, run Debian maintainer
+scripts, or load/unload an AppArmor profile. Updates use a separate
+user-controlled mechanism: it checks a new Debian artifact, builds a new Pacman
+package, and offers to install it.
 
-Install `base-devel`, `python`, `binutils`, `libarchive`, `devtools`, `namcap`,
-and `desktop-file-utils` in an Arch x86_64 environment. The declared runtime
-dependencies are installed by Pacman when the package is installed.
+## Requirements
 
-The pinned source is a mutable `latest` URL. The recorded SHA-256 is mandatory:
+- Arch Linux `x86_64`;
+- build tools: `base-devel`, `python`, `binutils`, `libarchive`;
+- an active per-user systemd session for automatic checks;
+- optional: `libnotify` for the **Install** button in the notification. Without
+  it, the update is reported only in the journal/standard output.
+
+```sh
+sudo pacman -S --needed base-devel python binutils libarchive
+```
+
+## First build and installation
+
+Clone this repository, then run the following from its root:
 
 ```sh
 makepkg --verifysource
 makepkg -si
 ```
 
-Never replace `sha256sums` with `SKIP`. HTTPS plus a pinned hash protects this
-reviewed input from silent replacement, but it is not an upstream signature
-chain.
+`makepkg --verifysource` checks the Debian file against the pinned SHA-256
+checksum. Do not replace the checksum with `SKIP`.
 
-## Optional update checker
+Before installation, remove any other Pacman package that already owns ChatGPT
+files (for example, `/usr/bin/chatgpt` or `/usr/lib/chatgpt`). Pacman will stop
+on a conflict; read its output and remove only the package that actually causes
+the conflict. Do not bypass the conflict with `--overwrite`.
 
-Install the package and opt into the user timer with:
+You can verify the installed package and launcher with:
 
 ```sh
-./scripts/install-and-enable-update-checker.sh
+pacman -Q chatgpt-bin
+pacman -Qkk chatgpt-bin
+readlink -f /usr/bin/chatgpt
+chatgpt
+```
+
+## Automatic updates
+
+Enable the per-user timer after installation:
+
+```sh
+systemctl --user enable --now chatgpt-bin-update-check.timer
 systemctl --user list-timers chatgpt-bin-update-check.timer
 ```
 
-Manual update flow:
+The timer runs daily with a randomized delay of up to one hour and starts
+`chatgpt-bin-update-workflow.service`, not just the check service. The flow is:
+
+1. A candidate is checked and validated locally.
+2. If a new version is found, the package is built as the current user in a
+   private cache.
+3. A notification with an **Install** button appears.
+4. Only clicking **Install** invokes Polkit (`pkexec`) to install the verified
+   ready package through Pacman.
+
+Neither the timer nor the build runs an automatic root installation. If
+notifications are unavailable, the button is not clicked, or a different
+action is selected, the package is not installed: run
+`chatgpt-bin-update install` yourself when you are ready to authenticate with
+Polkit.
+
+Installation is possible only after clicking the **Install** notification
+action (`only after clicking the Install notification action`).
+
+If there is no saved candidate or source validator, the check performs a normal
+HTTP GET. ETag or Last-Modified is saved only after a new candidate is accepted
+and written, or when the downloaded candidate matches the one already saved. A
+conditional HEAD request and `304 Not Modified` response are used only when
+both a saved candidate and its validator exist; in that case the `.deb` is not
+downloaded again. An unsupported HEAD request or a preflight error falls back
+to a normal GET.
+
+## Manual control
+
+Run all commands below as a regular user:
 
 ```sh
+# Check the source; exit code 10 means that a new candidate was found.
 chatgpt-bin-update check
+
+# Show the saved, verified candidate.
+chatgpt-bin-update status
+
+# Build the saved candidate without sudo and without installing it.
+chatgpt-bin-update build
+
+# Install a compatible package that has already been built; Polkit opens.
+chatgpt-bin-update install
+
+# Run check -> build -> notification with Install in one invocation.
+chatgpt-bin-update workflow
+```
+
+Timer/service status and logs:
+
+```sh
+systemctl --user status chatgpt-bin-update-check.timer
+systemctl --user status chatgpt-bin-update-workflow.service
+journalctl --user -u chatgpt-bin-update-workflow.service --since today
+journalctl --user -u chatgpt-bin-update-check.service --since today
+```
+
+## Troubleshooting
+
+### `403`, DNS, or download errors
+
+This usually means an unavailable CDN, DNS, captive portal, proxy, or network.
+Check connectivity and DNS, then retry later:
+
+```sh
+getent hosts persistent.oaistatic.com
+chatgpt-bin-update check
+```
+
+Do not disable SHA-256 verification or replace the URL with an arbitrary mirror.
+
+### `no-compatible-current-build` or “no compatible current build”
+
+The recorded build report is intentionally tied to the currently installed
+recipe and the hash of the ready archive. After the wrapper package is updated,
+an old report may be rejected. Build again, then install:
+
+```sh
 chatgpt-bin-update build
 chatgpt-bin-update install
-journalctl --user -u chatgpt-bin-update-check.service
 ```
 
-## Review and update a new source
+### An old report or missing archive
 
-Download a candidate `.deb` into a fresh local cache. The review command does
-not fetch data, mutate package files, run application code, or invoke
-`makepkg`:
+Do not edit the JSON report or try to install the archive manually. Run
+`chatgpt-bin-update build`; it creates a new archive and report in the user
+cache. Installation accepts only a matching report/archive pair.
+
+### “A ready package already exists”
+
+The current wrapper uses `makepkg -f` and isolates the old expected archive
+before starting, so a newly built package should not be mistaken for the old
+one. If this message comes from an earlier installation, update the wrapper
+package using the instructions below and run `chatgpt-bin-update build` again.
+
+### `usr/src/debug` appears in the archive or an error
+
+The current recipe explicitly disables the debug package (`options=(!strip
+!debug)`). Such an artifact indicates an old recipe, an old build, or an
+external `makepkg` configuration. Reinstall the current wrapper, rebuild the
+candidate, and do not install a suspicious old archive.
+
+## Updating the wrapper
+
+The wrapper is `chatgpt-bin` itself: along with the app, it installs the update
+scripts, recipe, unit files, and Polkit rule. After obtaining a new repository
+version, rebuild and reinstall it from the repository root:
 
 ```sh
-python scripts/review_source.py --deb /fresh/cache/chatgpt_amd64.deb --format json
+makepkg --verifysource
+makepkg -si
+systemctl --user daemon-reload
+systemctl --user enable --now chatgpt-bin-update-check.timer
 ```
 
-Before accepting a new artifact, manually inspect its Debian control version,
-SHA-256, allowlisted data manifest, desktop file, AppArmor profile, executable
-ELF and native `.node` dependencies, and licenses. Review every changed file;
-the package deliberately supports only the expected paths and drops Debian
-Lintian metadata.
+Then run `chatgpt-bin-update build` again if a build had already been created:
+the old report is intentionally incompatible with an updated recipe.
 
-After that human review, the guarded editor can change the four coupled
-metadata fields and regenerate `.SRCINFO`:
+## Recipe checks and development
 
-```sh
-python scripts/update_source.py \
-  --deb /fresh/cache/chatgpt_amd64.deb \
-  --apply \
-  --expected-version VERSION \
-  --expected-sha256 LOWERCASE_SHA256
-```
-
-Run it from the repository root (or pass `--repo-root PATH`). It rejects a
-missing or mismatched expected value. Do not update only a subset: `pkgver`,
-`pkgrel=1`, `sha256sums`, and `SOURCE_DATE_EPOCH` must change together after
-review.
-
-## Offline static gate
+These commands do not publish the package or change Pacman settings:
 
 ```sh
 python -m unittest discover -s tests -v
 bash -n PKGBUILD
 makepkg --printsrcinfo | diff -u .SRCINFO -
+git diff --check
 ```
 
-These checks do not download, extract a production artifact, execute the
-application, or alter package-manager configuration.
-
-## Package inspection before installation
-
-After a local build, replace `PACKAGE` with the generated package path and run:
+To inspect an already built archive manually, replace `PACKAGE` with its path:
 
 ```sh
 pacman -Qip PACKAGE
-pacman -Qlp PACKAGE | tee package-file-list.txt
-mkdir -p package-check
-bsdtar -xf PACKAGE -C package-check
-desktop-file-validate package-check/usr/share/applications/chatgpt.desktop
-find package-check -type f \( -perm -0100 -o -name '*.node' \) -print0 \
-  | xargs -0r readelf -d | tee elf-needed.txt
-namcap PACKAGE | tee namcap.txt
+pacman -Qlp PACKAGE
 ```
 
-Use `pacman -Qo` on every observed required SONAME provider to reconcile the
-declared dependencies. Review every `namcap` finding; do not suppress findings
-without evidence. Confirm that `Icon=chatgpt` resolves to the shipped
-`/usr/share/pixmaps/chatgpt.png` and that `/usr/bin/chatgpt` resolves to the
-upstream `/usr/lib/chatgpt/codex-launcher`.
-
-`apparmor` is optional and the packaged profile is a Pacman backup file only.
-It is not a sandbox, and this package does not load it.
-
-## Clean-Arch release boundary
-
-Use a fresh verified source cache and two independent x86_64 clean chroots.
-`makechrootpkg` reads `SRCDEST`, while `-D` bind-mounts that cache read-only
-inside the chroot; `-I` is intentionally not used because it installs an Arch
-package into the chroot rather than providing a source artifact.
+Releasing from a clean Arch environment also requires `devtools`. Pass the
+already verified `.deb` through a separate source cache mounted read-only in the
+chroot:
 
 ```sh
 SOURCE_CACHE=/fresh/cache
 test -f "$SOURCE_CACHE/chatgpt_amd64.deb"
-SRCDEST="$SOURCE_CACHE" makepkg --verifysource | tee verifysource.log
-SOURCE_DATE_EPOCH="$(python scripts/review_source.py --deb /fresh/cache/chatgpt_amd64.deb --format json | jq -r .source_date_epoch)" \
-  SRCDEST="$SOURCE_CACHE" extra-x86_64-build -D "$SOURCE_CACHE"
+SRCDEST="$SOURCE_CACHE" makepkg --verifysource
+SRCDEST="$SOURCE_CACHE" extra-x86_64-build -D "$SOURCE_CACHE"
 ```
 
-Run the same command twice with the same reviewed artifact, tool version, and
-epoch. Compare the results with:
+## Security boundaries
 
-```sh
-diffoscope --text reproducibility-diff.txt first/PACKAGE second/PACKAGE
-```
-
-If archive signatures or tool metadata differ, compare normalized extracted
-payload and package metadata; any remaining content difference is a release
-blocker. Keep `verifysource.log`, `package-file-list.txt`, `elf-needed.txt`,
-`namcap.txt`, `pacman-install-remove.log`, `reproducibility-diff.txt`, and
-`gui-smoke-test.md` as release evidence.
-
-In a disposable Arch environment, install only the reviewed package with
-`sudo pacman -U PACKAGE`, then run `pacman -Qkk chatgpt-bin`,
-`readlink -f /usr/bin/chatgpt`, and `desktop-file-validate` on its installed
-desktop file. Remove it with `sudo pacman -Rns chatgpt-bin` and record the
-Pacman result. Confirm that no APT configuration, keyring, or AppArmor
-load/unload action occurred.
-
-The GUI smoke test is manual and uses no account or credentials: as an
-unprivileged user in a graphical session, launch `chatgpt` and confirm only the
-sign-in window appears. When Wayland is available, separately record the
-result of:
-
-```sh
-chatgpt --enable-features=UseOzonePlatform --ozone-platform=wayland
-```
-
-Do not publish, sign, upload, or create a package repository as part of these
-checks.
+This is a local repackaging, not a trusted OpenAI signature chain for Arch. The
+pinned SHA-256 protects the currently verified download from silent
+substitution, but it does not replace an independent audit of a new upstream
+artifact. The automatic flow does not promise that OpenAI will maintain the
+URL, ETag, Debian builds, or Linux client self-updating. Do not run update
+commands with `sudo`; root is requested only during the final, explicit
+installation step through Polkit.

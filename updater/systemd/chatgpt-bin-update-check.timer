@@ -5,6 +5,7 @@ Description=Daily ChatGPT package update check
 OnCalendar=daily
 RandomizedDelaySec=1h
 Persistent=true
+Unit=chatgpt-bin-update-workflow.service
 
 [Install]
 WantedBy=timers.target

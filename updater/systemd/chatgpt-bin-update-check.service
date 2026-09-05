@@ -4,3 +4,4 @@ Description=Check for ChatGPT package updates
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/chatgpt-bin-check-update
+SuccessExitStatus=10

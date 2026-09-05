@@ -272,6 +272,11 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check for a reviewed ChatGPT Debian candidate")
     parser.add_argument("--url", default=DEFAULT_SOURCE_URL, help="candidate Debian URL")
     parser.add_argument("--metadata", type=Path, default=INSTALLED_METADATA_PATH, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--defer-new-candidate-notification",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args(argv)
 
 
@@ -336,7 +341,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ChatGPT update check failed: {_safe_line(error)}")
         return 4
     _write_source_validator_if_present(paths, source_validator)
-    _emit("ChatGPT update available", candidate.version, runner=subprocess.run, notify_send=NOTIFY_SEND)
+    if not arguments.defer_new_candidate_notification:
+        _emit("ChatGPT update available", candidate.version, runner=subprocess.run, notify_send=NOTIFY_SEND)
     return 10
 
 

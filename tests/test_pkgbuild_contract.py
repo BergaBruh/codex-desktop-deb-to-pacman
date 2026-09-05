@@ -46,7 +46,7 @@ _DEPENDS = {
 _MAKEDEPENDS = {"python", "binutils", "libarchive"}
 _OPTDEPENDS = {
     "apparmor: optional support for loading the upstream AppArmor profile",
-    "libnotify: desktop notifications for update checks; stdout fallback is used when unavailable",
+    "libnotify: desktop notifications and update install action prompts; stdout fallback is used when unavailable",
 }
 
 
@@ -68,6 +68,13 @@ def _pkgbuild_array(contents: str, name: str) -> set[str]:
     return set(re.findall(r"'([^']+)'", match.group(1)))
 
 
+def _pkgbuild_word_array(contents: str, name: str) -> set[str]:
+    match = re.search(rf"(?ms)^{re.escape(name)}=\((.*?)\)", contents)
+    if match is None:
+        raise AssertionError(f"missing {name} array in PKGBUILD")
+    return set(match.group(1).split())
+
+
 class PkgbuildContractTests(unittest.TestCase):
     def test_pinned_metadata_dependencies_and_safe_staging_contract(self) -> None:
         contents = PKGBUILD_PATH.read_text(encoding="utf-8")
@@ -80,10 +87,11 @@ class PkgbuildContractTests(unittest.TestCase):
         self.assertIn("license=('custom')", contents)
         self.assertIn(_URL, contents)
         self.assertIn(_SHA256, contents)
-        self.assertIn("options=(!strip)", contents)
+        self.assertIn("options=(!strip !debug)", contents)
         self.assertIn("backup=('etc/apparmor.d/chatgpt')", contents)
         self.assertIn("SOURCE_DATE_EPOCH=1786770000", contents)
         self.assertIn("apparmor: optional support for loading the upstream AppArmor profile", contents)
+        self.assertIn("desktop notifications and update install action prompts", contents)
         self.assertIn('python "$startdir/scripts/deb_payload.py"', contents)
         self.assertIn('install -Dm644 "$pkgdir/usr/share/doc/chatgpt/copyright"', contents)
 
@@ -129,12 +137,32 @@ class PkgbuildContractTests(unittest.TestCase):
         self.assertEqual(_srcinfo_value(contents, "pkgrel"), "1")
         self.assertEqual(_srcinfo_value(contents, "arch"), "x86_64")
 
+    def test_debug_source_artifacts_are_disabled_in_pkgbuild_and_srcinfo(self) -> None:
+        pkgbuild_options = _pkgbuild_word_array(PKGBUILD_PATH.read_text(encoding="utf-8"), "options")
+        srcinfo_options = _srcinfo_values(SRCINFO_PATH.read_text(encoding="utf-8"), "options")
+
+        self.assertIn("!strip", pkgbuild_options)
+        self.assertIn("!debug", pkgbuild_options)
+        self.assertNotIn("debug", pkgbuild_options)
+        self.assertIn("!strip", srcinfo_options)
+        self.assertIn("!debug", srcinfo_options)
+        self.assertNotIn("debug", srcinfo_options)
+
     def test_readme_exists_for_the_release_procedure(self) -> None:
         contents = README_PATH.read_text(encoding="utf-8")
 
         self.assertIn('SRCDEST="$SOURCE_CACHE" makepkg --verifysource', contents)
         self.assertIn('SRCDEST="$SOURCE_CACHE" extra-x86_64-build -D "$SOURCE_CACHE"', contents)
         self.assertNotIn(" -- -I ", contents)
+
+    def test_readme_documents_action_gated_update_workflow(self) -> None:
+        contents = README_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("chatgpt-bin-update workflow", contents)
+        self.assertIn("chatgpt-bin-update-check.service", contents)
+        self.assertIn("chatgpt-bin-update-workflow.service", contents)
+        self.assertIn("chatgpt-bin-update install", contents)
+        self.assertIn("only after clicking the Install notification action", contents)
 
 
 if __name__ == "__main__":

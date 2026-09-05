@@ -88,6 +88,10 @@ def _write_package(
         _add_file(archive, "usr/share/licenses/chatgpt-bin/copyright")
         _add_file(archive, "usr/bin/chatgpt-bin-update", mode=0o755)
         _add_file(archive, "usr/bin/chatgpt-bin-check-update", mode=0o755)
+        _add_file(archive, "usr/lib/chatgpt-bin/updater/workflow_update.py")
+        _add_file(archive, "usr/lib/chatgpt-bin/updater/recipe/updater/workflow_update.py")
+        _add_file(archive, "usr/lib/chatgpt-bin/updater/recipe/updater/systemd/chatgpt-bin-update-workflow.service")
+        _add_file(archive, "usr/lib/systemd/user/chatgpt-bin-update-workflow.service")
         _add_file(archive, "usr/libexec/chatgpt-bin/install-package", mode=0o755)
         _add_file(archive, "usr/share/polkit-1/actions/org.chatgpt-bin.install-package.policy")
         if install_hook:
@@ -116,8 +120,10 @@ def _write_recipe(path: Path) -> Path:
         "updater/check_update.py",
         "updater/common.py",
         "updater/install_package.py",
+        "updater/workflow_update.py",
         "updater/polkit/org.chatgpt-bin.install-package.policy",
         "updater/systemd/chatgpt-bin-update-check.service",
+        "updater/systemd/chatgpt-bin-update-workflow.service",
         "updater/systemd/chatgpt-bin-update-check.timer",
     ):
         target = path / relative
@@ -430,7 +436,8 @@ class PublicInstallCommandTests(unittest.TestCase):
                 calls.append([str(argument) for argument in argv])
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-            self.assertEqual(build_update._install(paths, runner=runner), 0)
+            with mock.patch.object(build_update, "INSTALLED_RECIPE_DIR", recipe):
+                self.assertEqual(build_update._install(paths, runner=runner), 0)
 
             self.assertEqual(
                 calls,
@@ -445,6 +452,124 @@ class PublicInstallCommandTests(unittest.TestCase):
                     ]
                 ],
             )
+
+    def test_public_install_skips_newer_stale_recipe_report_for_current_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = build_update.cache_paths(
+                {
+                    "XDG_CACHE_HOME": str(root / "cache"),
+                    "XDG_STATE_HOME": str(root / "state"),
+                }
+            )
+            current_recipe = _write_recipe(root / "current-recipe")
+            stale_recipe = _write_recipe(root / "stale-recipe")
+            (stale_recipe / "PKGBUILD").write_text("# stale immutable recipe\n", encoding="utf-8")
+            candidate_bytes = b"reviewed candidate deb"
+            candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+            candidate = paths.download_dir / f"chatgpt_amd64-{candidate_sha256}.deb"
+            candidate.write_bytes(candidate_bytes)
+            current_archive = paths.package_dir / f"{PACKAGE_NAME}-{PACKAGE_VERSION}-1-{PACKAGE_ARCH}.pkg.tar"
+            stale_archive = paths.package_dir / f"{PACKAGE_NAME}-{PACKAGE_VERSION}-2-{PACKAGE_ARCH}.pkg.tar"
+            _write_package(current_archive)
+            _write_package(stale_archive, extra="usr/share/stale-recipe-only")
+            current_report = _report_path(paths.package_dir, current_archive)
+            stale_report = _report_path(paths.package_dir, stale_archive)
+            _write_report(current_report, current_archive, candidate, current_recipe)
+            _write_report(stale_report, stale_archive, candidate, stale_recipe)
+            os.utime(current_report, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(stale_report, ns=(2_000_000_000, 2_000_000_000))
+            calls: list[list[str]] = []
+
+            def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                calls.append([str(argument) for argument in argv])
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with mock.patch.object(build_update, "INSTALLED_RECIPE_DIR", current_recipe):
+                self.assertEqual(build_update._install(paths, runner=runner), 0)
+
+            self.assertEqual(
+                calls,
+                [
+                    [
+                        "pkexec",
+                        "/usr/libexec/chatgpt-bin/install-package",
+                        "--report",
+                        str(current_report),
+                        "--archive",
+                        str(current_archive),
+                    ]
+                ],
+            )
+
+    def test_public_install_reports_no_compatible_current_build_without_pkexec(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = build_update.cache_paths(
+                {
+                    "XDG_CACHE_HOME": str(root / "cache"),
+                    "XDG_STATE_HOME": str(root / "state"),
+                }
+            )
+            current_recipe = _write_recipe(root / "current-recipe")
+            stale_recipe = _write_recipe(root / "stale-recipe")
+            (stale_recipe / "PKGBUILD").write_text("# stale immutable recipe\n", encoding="utf-8")
+            candidate_bytes = b"reviewed candidate deb"
+            candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+            candidate = paths.download_dir / f"chatgpt_amd64-{candidate_sha256}.deb"
+            candidate.write_bytes(candidate_bytes)
+            archive = paths.package_dir / f"{PACKAGE_NAME}-{PACKAGE_VERSION}-1-{PACKAGE_ARCH}.pkg.tar"
+            _write_package(archive)
+            report = _report_path(paths.package_dir, archive)
+            _write_report(report, archive, candidate, stale_recipe)
+            calls: list[list[str]] = []
+
+            def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                calls.append([str(argument) for argument in argv])
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with mock.patch.object(build_update, "INSTALLED_RECIPE_DIR", current_recipe), mock.patch(
+                "sys.stdout",
+                new_callable=io.StringIO,
+            ) as output:
+                self.assertEqual(build_update._install(paths, runner=runner), 1)
+
+            self.assertEqual(calls, [])
+            self.assertIn("no-compatible-current-build", output.getvalue())
+
+    def test_public_install_rejects_report_whose_archive_digest_changed_without_pkexec(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = build_update.cache_paths(
+                {
+                    "XDG_CACHE_HOME": str(root / "cache"),
+                    "XDG_STATE_HOME": str(root / "state"),
+                }
+            )
+            recipe = _write_recipe(root / "immutable-recipe")
+            candidate_bytes = b"reviewed candidate deb"
+            candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+            candidate = paths.download_dir / f"chatgpt_amd64-{candidate_sha256}.deb"
+            candidate.write_bytes(candidate_bytes)
+            archive = paths.package_dir / f"{PACKAGE_NAME}-{PACKAGE_VERSION}-1-{PACKAGE_ARCH}.pkg.tar"
+            _write_package(archive)
+            report = _report_path(paths.package_dir, archive)
+            _write_report(report, archive, candidate, recipe)
+            archive.write_bytes(b"archive contents changed after report was written")
+            calls: list[list[str]] = []
+
+            def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                calls.append([str(argument) for argument in argv])
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with mock.patch.object(build_update, "INSTALLED_RECIPE_DIR", recipe), mock.patch(
+                "sys.stdout",
+                new_callable=io.StringIO,
+            ) as output:
+                self.assertEqual(build_update._install(paths, runner=runner), 1)
+
+            self.assertEqual(calls, [])
+            self.assertIn("no-compatible-current-build", output.getvalue())
 
     def test_public_install_rejects_missing_build_report_without_pkexec(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

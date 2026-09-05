@@ -18,8 +18,17 @@ case "$command_name" in
     script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd) || exit 1
     exec /usr/bin/python "$script_dir/build_update.py" "$@"
     ;;
+  workflow)
+    shift
+    installed_workflow=/usr/lib/chatgpt-bin/updater/workflow_update.py
+    if [ -f "$installed_workflow" ]; then
+      exec /usr/bin/python "$installed_workflow" "$@"
+    fi
+    script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd) || exit 1
+    exec /usr/bin/python "$script_dir/workflow_update.py" "$@"
+    ;;
   *)
-    printf '%s\n' 'Usage: chatgpt-bin-update {check|status|build|install} [arguments...]' >&2
+    printf '%s\n' 'Usage: chatgpt-bin-update {check|status|build|install|workflow} [arguments...]' >&2
     exit 2
     ;;
 esac

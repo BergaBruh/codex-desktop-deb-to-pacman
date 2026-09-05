@@ -59,6 +59,10 @@ def _sha256(path: Path) -> str:
         return hashlib.file_digest(contents, "sha256").hexdigest()
 
 
+def _is_lower_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 def _ensure_cache_layout(paths: CachePaths) -> None:
     expected = {
         "recipe workspace": paths.cache_dir / "recipe",
@@ -111,6 +115,8 @@ def _copy_recipe(source: Path, destination: Path) -> None:
 
 
 def _hash_recipe(recipe_root: Path) -> str:
+    if not recipe_root.is_dir() or recipe_root.is_symlink():
+        raise BuildUpdateError("installed updater recipe is missing")
     digest = hashlib.sha256()
     for path in sorted(recipe_root.rglob("*")):
         relative = path.relative_to(recipe_root).as_posix()
@@ -192,7 +198,7 @@ def _run_makepkg(
     work_dir: Path,
     runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> subprocess.CompletedProcess[str]:
-    argv = ["makepkg"]
+    argv = ["makepkg", "-f"]
     if set(argv) & PROHIBITED_MAKEPKG_FLAGS:
         raise BuildUpdateError("internal makepkg invocation requested a prohibited install or sync flag")
     environment = os.environ.copy()
@@ -213,15 +219,72 @@ def _run_makepkg(
     )
 
 
-def _find_built_archive(pkgdest: Path, version: str, before: set[Path]) -> Path:
-    candidates = [
-        path
-        for path in pkgdest.glob(f"{PACKAGE_NAME}-{version}-*-{PACKAGE_ARCHITECTURE}.pkg.tar*")
-        if path.is_file() and path not in before and not path.name.endswith(".sig")
-    ]
-    if len(candidates) != 1:
-        raise BuildUpdateError(f"expected exactly one built {PACKAGE_NAME} package archive, found {len(candidates)}")
-    return candidates[0]
+def _pkgbuild_assignment(recipe_root: Path, name: str) -> str:
+    prefix = f"{name}="
+    values: list[str] = []
+    for line in (recipe_root / "PKGBUILD").read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            value = stripped.removeprefix(prefix).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            values.append(value)
+    if len(values) != 1:
+        raise BuildUpdateError(f"expected exactly one {name} assignment in PKGBUILD")
+    value = values[0]
+    if not value or "/" in value or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise BuildUpdateError(f"PKGBUILD {name} assignment is invalid")
+    return value
+
+
+def _expected_archive_stem(recipe_root: Path, version: str) -> str:
+    pkgrel = _pkgbuild_assignment(recipe_root, "pkgrel")
+    return f"{PACKAGE_NAME}-{version}-{pkgrel}-{PACKAGE_ARCHITECTURE}.pkg.tar"
+
+
+def _matching_expected_archives(pkgdest: Path, archive_stem: str) -> list[Path]:
+    candidates: list[Path] = []
+    for path in pkgdest.glob(f"{archive_stem}*"):
+        if path.name.endswith(".sig"):
+            continue
+        if path.name == archive_stem or path.name.startswith(f"{archive_stem}."):
+            candidates.append(path)
+    return candidates
+
+
+def _quarantine_preexisting_archive(pkgdest: Path, archive_stem: str, quarantine_dir: Path) -> None:
+    matches = _matching_expected_archives(pkgdest, archive_stem)
+    if len(matches) > 1:
+        raise BuildUpdateError(f"expected at most one preexisting {PACKAGE_NAME} package archive, found {len(matches)}")
+    if not matches:
+        return
+    archive_path = matches[0]
+    try:
+        archive_stat = archive_path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(archive_stat.st_mode) or archive_stat.st_uid != os.geteuid():
+        raise BuildUpdateError("preexisting package archive is not a regular tool-owned file")
+    quarantine_dir.mkdir(mode=0o700)
+    quarantine_dir.chmod(0o700)
+    quarantine_path = quarantine_dir / archive_path.name
+    os.replace(archive_path, quarantine_path)
+    try:
+        archive_path.lstat()
+    except FileNotFoundError:
+        return
+    raise BuildUpdateError("preexisting package archive could not be quarantined")
+
+
+def _find_built_archive(pkgdest: Path, archive_stem: str) -> Path:
+    matches = _matching_expected_archives(pkgdest, archive_stem)
+    if len(matches) != 1:
+        raise BuildUpdateError(f"expected exactly one freshly built {PACKAGE_NAME} package archive, found {len(matches)}")
+    expected_archive = matches[0]
+    archive_stat = expected_archive.lstat()
+    if not stat.S_ISREG(archive_stat.st_mode) or archive_stat.st_uid != os.geteuid():
+        raise BuildUpdateError("freshly built package archive is not a regular tool-owned file")
+    return expected_archive
 
 
 def _record_payload(record: CandidateRecord) -> dict[str, object]:
@@ -274,11 +337,12 @@ def build_candidate(
         review_metadata = _review_again(candidate, reviewed)
         _run_update_source(recipe_workspace, candidate, reviewed)
         recipe_sha256 = _hash_recipe(recipe_workspace)
-        before_packages = {path for path in paths.package_dir.glob("*.pkg.tar*") if path.is_file()}
+        expected_archive_stem = _expected_archive_stem(recipe_workspace, reviewed.version)
+        _quarantine_preexisting_archive(paths.package_dir, expected_archive_stem, workspace_root / "quarantine")
         result = _run_makepkg(recipe_workspace, srcdest, paths.package_dir, makepkg_work, runner)
         if result.returncode:
             raise BuildUpdateError(f"makepkg failed: {_safe_line(result.stderr.strip() or result.stdout.strip())}")
-        archive_path = _find_built_archive(paths.package_dir, reviewed.version, before_packages)
+        archive_path = _find_built_archive(paths.package_dir, expected_archive_stem)
         archive_sha256 = _sha256(archive_path)
         report = {
             "schema_version": 1,
@@ -347,6 +411,44 @@ def _build(paths: CachePaths, runner: Callable[..., subprocess.CompletedProcess[
     return 0
 
 
+def _read_build_report(report_path: Path) -> Mapping[str, object]:
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if not isinstance(report, Mapping):
+        raise ValueError("cached build report is malformed")
+    return report
+
+
+def _compatible_build_report(paths: CachePaths, report_path: Path, current_recipe_sha256: str) -> tuple[Path, Path] | None:
+    try:
+        report = _read_build_report(report_path)
+        package = report.get("package")
+        recipe = report.get("recipe")
+        if not isinstance(package, Mapping) or not isinstance(recipe, Mapping):
+            return None
+        archive_path = Path(str(package.get("archive_path")))
+        package_sha256 = package.get("sha256")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if package.get("name") != PACKAGE_NAME or package.get("architecture") != PACKAGE_ARCHITECTURE:
+        return None
+    if not _is_lower_sha256(package_sha256) or package_sha256 not in report_path.name:
+        return None
+    if recipe.get("source_path") != str(INSTALLED_RECIPE_DIR):
+        return None
+    if recipe.get("base_sha256") != current_recipe_sha256:
+        return None
+    if not archive_path.is_absolute() or archive_path.parent != paths.package_dir:
+        return None
+    if not archive_path.is_file() or archive_path.is_symlink():
+        return None
+    try:
+        if _sha256(archive_path) != package_sha256:
+            return None
+    except OSError:
+        return None
+    return report_path, archive_path
+
+
 def _load_latest_build_report(paths: CachePaths) -> tuple[Path, Path]:
     reports = sorted(
         (path for path in paths.package_dir.glob(f"{PACKAGE_NAME}-*.build.json") if path.is_file() and not path.is_symlink()),
@@ -355,23 +457,12 @@ def _load_latest_build_report(paths: CachePaths) -> tuple[Path, Path]:
     )
     if not reports:
         raise FileNotFoundError("no built ChatGPT package report is cached")
-    report_path = reports[0]
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-        package = report["package"]
-        archive_path = Path(package["archive_path"])
-        package_sha256 = package["sha256"]
-    except (KeyError, TypeError, json.JSONDecodeError) as error:
-        raise ValueError("cached build report is malformed") from error
-    if package.get("name") != PACKAGE_NAME or package.get("architecture") != PACKAGE_ARCHITECTURE:
-        raise ValueError("cached build report does not describe chatgpt-bin x86_64")
-    if not isinstance(package_sha256, str) or package_sha256 not in report_path.name:
-        raise ValueError("cached build report is not bound to the package digest")
-    if not archive_path.is_absolute() or archive_path.parent != paths.package_dir:
-        raise ValueError("cached build report archive path is outside the updater package cache")
-    if not archive_path.is_file() or archive_path.is_symlink():
-        raise FileNotFoundError("cached build report package archive is missing")
-    return report_path, archive_path
+    current_recipe_sha256 = _hash_recipe(INSTALLED_RECIPE_DIR)
+    for report_path in reports:
+        compatible = _compatible_build_report(paths, report_path, current_recipe_sha256)
+        if compatible is not None:
+            return compatible
+    raise FileNotFoundError("no-compatible-current-build: no cached build report matches the current installed recipe and package archive")
 
 
 def _install(
@@ -383,7 +474,7 @@ def _install(
     except FileNotFoundError as error:
         print(f"ChatGPT update install failed: {_safe_line(error)}")
         return 1
-    except (OSError, ValueError) as error:
+    except (BuildUpdateError, OSError, ValueError) as error:
         print(f"ChatGPT update install failed: {_safe_line(error)}")
         return 2
     result = runner(

@@ -21,12 +21,14 @@ _FORBIDDEN_PRIVILEGED_COMMANDS = {"pkexec", "sudo", "pacman", "systemctl"}
 
 
 class _FakeMakepkg:
-    def __init__(self, *, returncode: int = 0, create_archive: bool = True) -> None:
+    def __init__(self, *, returncode: int = 0, create_archive: bool = True, create_archive_on_failure: bool = False) -> None:
         self.returncode = returncode
         self.create_archive = create_archive
+        self.create_archive_on_failure = create_archive_on_failure
         self.argv: list[str] = []
         self.kwargs: dict[str, object] = {}
         self.commands: list[list[str]] = []
+        self.archive_existed_during_makepkg: bool | None = None
 
     def __call__(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         self.argv = [str(argument) for argument in argv]
@@ -34,14 +36,31 @@ class _FakeMakepkg:
         self.commands.append(self.argv)
         if self.argv[0] in _FORBIDDEN_PRIVILEGED_COMMANDS:
             raise AssertionError(f"privileged command was requested: {self.argv!r}")
-        if self.create_archive and self.returncode == 0:
+        if self.create_archive and (self.returncode == 0 or self.create_archive_on_failure):
             environment = kwargs.get("env")
             if not isinstance(environment, dict) or "PKGDEST" not in environment:
                 raise AssertionError("makepkg runner did not receive PKGDEST")
             archive = Path(str(environment["PKGDEST"])) / "chatgpt-bin-26.810.52044-1-x86_64.pkg.tar.zst"
             archive.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.archive_existed_during_makepkg = archive.exists()
             archive.write_bytes(b"fake arch package archive")
         return subprocess.CompletedProcess(self.argv, self.returncode, stdout="", stderr="makepkg failed")
+
+
+class _UtimeOnlyMakepkg:
+    def __init__(self, archive: Path) -> None:
+        self.archive = archive
+        self.argv: list[str] = []
+        self.commands: list[list[str]] = []
+        self.archive_existed_during_makepkg: bool | None = None
+
+    def __call__(self, argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        self.argv = [str(argument) for argument in argv]
+        self.commands.append(self.argv)
+        self.archive_existed_during_makepkg = self.archive.exists()
+        if self.archive_existed_during_makepkg:
+            self.archive.touch()
+        return subprocess.CompletedProcess(self.argv, 0, stdout="", stderr="")
 
 
 class BuildUpdateTests(unittest.TestCase):
@@ -168,6 +187,32 @@ class BuildUpdateTests(unittest.TestCase):
             self.assertEqual(manifest["package"]["sha256"], artifact.sha256)
             self.assertEqual(manifest["allowed_package_paths"], list(record.allowed_members))
 
+    def test_build_force_rebuilds_preexisting_archive_and_writes_report_for_refreshed_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = self._paths(root)
+            record = self._record(paths)
+            recipe = self._recipe_fixture(root)
+            archive = paths.package_dir / "chatgpt-bin-26.810.52044-1-x86_64.pkg.tar.zst"
+            other_archive = paths.package_dir / "chatgpt-bin-26.810.52044-2-x86_64.pkg.tar.zst"
+            archive.write_bytes(b"stale package from an earlier build")
+            other_archive.write_bytes(b"unrelated cached package")
+            fake_runner = _FakeMakepkg()
+
+            with self._tool_patch(), mock.patch.object(build_update, "INSTALLED_RECIPE_DIR", recipe):
+                artifact = build_update.build_candidate(record, paths, fake_runner)
+
+            manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(fake_runner.argv, ["makepkg", "-f"])
+            self.assertIs(fake_runner.archive_existed_during_makepkg, False)
+            self.assertEqual(artifact.archive_path, archive)
+            self.assertEqual(archive.read_bytes(), b"fake arch package archive")
+            self.assertEqual(other_archive.read_bytes(), b"unrelated cached package")
+            self.assertEqual(artifact.sha256, hashlib.sha256(archive.read_bytes()).hexdigest())
+            self.assertEqual(manifest["package"]["archive_path"], str(archive))
+            self.assertEqual(manifest["package"]["sha256"], artifact.sha256)
+            self.assertIn(artifact.sha256, artifact.manifest_path.name)
+
     def test_build_preflight_requires_makepkg_fakeroot_python_and_bsdtar_before_running_makepkg(self) -> None:
         for missing in ("makepkg", "fakeroot", "python", "bsdtar"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temporary_directory:
@@ -234,10 +279,45 @@ class BuildUpdateTests(unittest.TestCase):
             self.assertFalse({command[0] for command in fake_runner.commands} & _FORBIDDEN_PRIVILEGED_COMMANDS)
             self.assertFalse(list(paths.package_dir.glob("*.json")))
 
+    def test_makepkg_failure_writes_no_report_even_if_makepkg_left_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = self._paths(root)
+            record = self._record(paths)
+            recipe = self._recipe_fixture(root)
+            fake_runner = _FakeMakepkg(returncode=7, create_archive=True, create_archive_on_failure=True)
+
+            with self._tool_patch(), mock.patch.object(build_update, "INSTALLED_RECIPE_DIR", recipe):
+                with self.assertRaisesRegex(build_update.BuildUpdateError, "makepkg failed"):
+                    build_update.build_candidate(record, paths, fake_runner)
+
+            self.assertEqual(fake_runner.argv, ["makepkg", "-f"])
+            self.assertTrue(list(paths.package_dir.glob("*.pkg.tar*")))
+            self.assertFalse(list(paths.package_dir.glob("*.build.json")))
+
+    def test_makepkg_success_that_only_utimes_preexisting_archive_writes_no_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = self._paths(root)
+            record = self._record(paths)
+            recipe = self._recipe_fixture(root)
+            archive = paths.package_dir / "chatgpt-bin-26.810.52044-1-x86_64.pkg.tar.zst"
+            archive.write_bytes(b"stale package from an earlier build")
+            fake_runner = _UtimeOnlyMakepkg(archive)
+
+            with self._tool_patch(), mock.patch.object(build_update, "INSTALLED_RECIPE_DIR", recipe):
+                with self.assertRaisesRegex(build_update.BuildUpdateError, "freshly built"):
+                    build_update.build_candidate(record, paths, fake_runner)
+
+            self.assertEqual(fake_runner.argv, ["makepkg", "-f"])
+            self.assertIs(fake_runner.archive_existed_during_makepkg, False)
+            self.assertFalse(archive.exists())
+            self.assertFalse(list(paths.package_dir.glob("*.build.json")))
+
     def test_public_launcher_supports_check_status_build_and_install_commands(self) -> None:
         launcher = Path(__file__).resolve().parents[1] / "updater" / "chatgpt-bin-update"
 
-        for command in ("check", "status", "build", "install"):
+        for command in ("check", "status", "build", "install", "workflow"):
             with self.subTest(command=command):
                 result = subprocess.run(
                     [str(launcher), command, "--help"],

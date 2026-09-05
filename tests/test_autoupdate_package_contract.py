@@ -14,6 +14,7 @@ PKGBUILD_PATH = REPOSITORY_ROOT / "PKGBUILD"
 SRCINFO_PATH = REPOSITORY_ROOT / ".SRCINFO"
 WRAPPER_PATH = REPOSITORY_ROOT / "scripts" / "install-and-enable-update-checker.sh"
 SERVICE_PATH = REPOSITORY_ROOT / "updater" / "systemd" / "chatgpt-bin-update-check.service"
+WORKFLOW_SERVICE_PATH = REPOSITORY_ROOT / "updater" / "systemd" / "chatgpt-bin-update-workflow.service"
 TIMER_PATH = REPOSITORY_ROOT / "updater" / "systemd" / "chatgpt-bin-update-check.timer"
 
 UPDATER_INSTALL_ROOT = "/usr/lib/chatgpt-bin/updater"
@@ -26,6 +27,7 @@ EXPECTED_RUNTIME_DESTINATIONS = {
     f"{UPDATER_INSTALL_ROOT}/deb_payload.py",
     f"{UPDATER_INSTALL_ROOT}/install_package.py",
     f"{UPDATER_INSTALL_ROOT}/review_source.py",
+    f"{UPDATER_INSTALL_ROOT}/workflow_update.py",
 }
 EXPECTED_RECIPE_REQUIRED_SOURCES = {
     ".SRCINFO",
@@ -40,6 +42,7 @@ EXPECTED_PUBLIC_COMMANDS = {
 }
 EXPECTED_USER_UNITS = {
     "/usr/lib/systemd/user/chatgpt-bin-update-check.service",
+    "/usr/lib/systemd/user/chatgpt-bin-update-workflow.service",
     "/usr/lib/systemd/user/chatgpt-bin-update-check.timer",
 }
 EXPECTED_PRIVILEGED_INSTALL_FILES = {
@@ -154,21 +157,31 @@ class AutoupdatePackageContractTests(unittest.TestCase):
         self.assertNotRegex(srcinfo, r"(?m)^\tdepends = libnotify$")
         self.assertRegex(srcinfo, r"(?m)^\toptdepends = libnotify:")
 
-    def test_user_units_are_detection_only_and_timer_is_opt_in(self) -> None:
+    def test_user_units_keep_manual_check_detection_only_and_timer_targets_workflow(self) -> None:
         service = _read(SERVICE_PATH)
+        workflow_service = _read(WORKFLOW_SERVICE_PATH)
         timer = _read(TIMER_PATH)
 
         self.assertIn("[Service]", service)
         self.assertIn("Type=oneshot", service)
         self.assertIn("ExecStart=/usr/bin/chatgpt-bin-check-update", service)
+        self.assertIn("SuccessExitStatus=10", service)
         self.assertNotIn("[Install]", service)
         for forbidden in ("makepkg", "pkexec", "sudo", "pacman", "systemctl", "chatgpt-bin-update build"):
             self.assertNotIn(forbidden, service)
+
+        self.assertIn("[Service]", workflow_service)
+        self.assertIn("Type=oneshot", workflow_service)
+        self.assertIn("ExecStart=/usr/bin/chatgpt-bin-update workflow", workflow_service)
+        self.assertNotIn("[Install]", workflow_service)
+        for forbidden in ("pkexec", "sudo", "pacman", "systemctl"):
+            self.assertNotIn(forbidden, workflow_service)
 
         self.assertIn("[Timer]", timer)
         self.assertIn("OnCalendar=daily", timer)
         self.assertIn("RandomizedDelaySec=1h", timer)
         self.assertIn("Persistent=true", timer)
+        self.assertIn("Unit=chatgpt-bin-update-workflow.service", timer)
         self.assertIn("[Install]", timer)
         self.assertIn("WantedBy=timers.target", timer)
 
@@ -178,6 +191,7 @@ class AutoupdatePackageContractTests(unittest.TestCase):
             SRCINFO_PATH,
             WRAPPER_PATH,
             SERVICE_PATH,
+            WORKFLOW_SERVICE_PATH,
             REPOSITORY_ROOT / "updater" / "chatgpt-bin-check-update",
             REPOSITORY_ROOT / "updater" / "chatgpt-bin-update",
             *(REPOSITORY_ROOT / "updater").glob("*.py"),

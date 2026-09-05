@@ -1,0 +1,6 @@
+[Unit]
+Description=Build ChatGPT package updates and prompt for installation
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/chatgpt-bin-update workflow
